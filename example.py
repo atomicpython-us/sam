@@ -19,10 +19,15 @@ from sam import SAM
 sam = SAM(pin=0)
 
 # Speak English text
-sam.say("hello world")
+
+text = "Hello World, testing 123 "
+
+print(f"saying {text}")
+sam.say(text)
 
 # Speak with phonemes directly (bypass reciter)
-sam.say_phonetic("/HEH4LOW WERLD")
+# print("saying /HEH4LOW WERLD")
+# sam.say_phonetic("/HEH4LOW WERLD")
 
 # ============================================================================
 # Voice customization
@@ -38,13 +43,13 @@ sam.set_throat(128)   # Default throat
 sam.set_pitch(40)
 sam.set_mouth(150)
 sam.set_throat(90)
-sam.say("i am a robot")
+# sam.say("i am a robot")
 
 # High-pitched voice
 sam.set_pitch(96)
 sam.set_mouth(128)
 sam.set_throat(128)
-sam.say("hello there")
+# sam.say("hello there")
 
 # Reset to defaults
 sam.set_pitch(64)

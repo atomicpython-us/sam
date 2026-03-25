@@ -378,6 +378,9 @@ def process_phonemes(input_str, speed=72):
     Full phoneme processing pipeline.
     Takes a phoneme string like '/HEH4LOW WERLD'
     Returns (phoneme_index, phoneme_length, stress) ready for rendering.
+
+    Note: speed is no longer used here - it controls ticks-per-frame
+    in the renderer instead. Kept in signature for API compatibility.
     """
     # Stage 1: Parse phoneme codes
     phoneme_index, stress_arr = parser1(input_str)
@@ -396,10 +399,5 @@ def process_phonemes(input_str, speed=72):
 
     # Insert breaths
     insert_breath(phoneme_index, phoneme_length, stress_arr)
-
-    # Apply speed
-    if speed != 72:
-        for i in range(len(phoneme_length)):
-            phoneme_length[i] = max(1, (phoneme_length[i] * speed) // 72)
 
     return phoneme_index, phoneme_length, stress_arr

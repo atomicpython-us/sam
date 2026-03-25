@@ -93,7 +93,8 @@ class SAM:
         # Render to audio samples
         buffer = render(
             phoneme_index, phoneme_length, stress,
-            pitch=self.pitch, mouth=self.mouth, throat=self.throat
+            speed=self.speed, pitch=self.pitch,
+            mouth=self.mouth, throat=self.throat
         )
 
         # Play through PWM
@@ -135,7 +136,8 @@ class SAM:
 
         return render(
             phoneme_index, phoneme_length, stress,
-            pitch=self.pitch, mouth=self.mouth, throat=self.throat
+            speed=self.speed, pitch=self.pitch,
+            mouth=self.mouth, throat=self.throat
         )
 
     def text_to_phonemes(self, text):

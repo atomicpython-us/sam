@@ -1,2 +1,9 @@
 .DS_Store
-
+__pycache__/
+*.pyc
+*.wav
+docs/_build/
+usamtts*
+test_samtts.py
+node_modules
+natmod/.mpy_ld_cache
