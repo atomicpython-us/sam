@@ -595,6 +595,22 @@ EXCEPTIONS = {
     'WIFI': 'WAY4FAY',
     'UART': 'YUW4AA4RT',
     'SPI': 'EH4SPIY4AY4',
+    'MCALEER': 'MAEKAXLIY4R',
+    'MICROPYTHON': 'MAY4KROWPAY4THAHN',
+    'KEVIN': 'KEH4VIHN',
+    'SUBSCRIBE': 'SAHBSKRAY4B',
+    'IBM': 'AY4BIY4EH4M',
+    'LIFT': 'LIH4FT',
+    'UNACCUSTOMED': 'AH4NAHKAH4STUMD',
+    'OBVIOUSLY': 'AA4BVIYAXSLIY',
+    'CONSIDERABLE': 'KAHNSIHDEHRAHBUL',
+    'INTRODUCE': 'IH4NTROWDUW4S',
+    'MAINFRAME': 'MEY4NFREY4M',
+    'SPEAKING': 'SPIY4KIHNX',
+    "I'D": 'AY4D',
+    "I'M": 'AY4M',
+    "I'LL": 'AY4L',
+    "I'VE": 'AY4V',
 }
 
 # All rules indexed by letter
@@ -796,16 +812,23 @@ def text_to_phonemes(text):
     while pos < len(text) - 1:
         ch = text[pos]
 
-        # Check exception dictionary for whole words
+        # Check exception dictionary for whole words (including contractions)
         if ch.isalpha():
-            # Find the end of this word
             wend = pos
-            while wend < len(text) and text[wend].isalpha():
+            while wend < len(text) and (text[wend].isalpha() or text[wend] == "'"):
                 wend += 1
+            # Try full word with apostrophe first, then without
             word = text[pos:wend]
             if word in EXCEPTIONS:
                 output.append(EXCEPTIONS[word])
                 pos = wend
+                continue
+            # Strip trailing apostrophe if no match
+            word_alpha = text[pos:wend].rstrip("'")
+            wend_alpha = pos + len(word_alpha)
+            if word_alpha != word and word_alpha in EXCEPTIONS:
+                output.append(EXCEPTIONS[word_alpha])
+                pos = wend_alpha
                 continue
 
         # Handle digits

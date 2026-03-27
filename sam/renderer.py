@@ -130,7 +130,7 @@ try:
         _NATIVE_STATUS = 'outdated (recompile for 22050 Hz)'
     else:
         _NATIVE_STATUS = 'active'
-except ImportError:
+except (ImportError, NotImplementedError, ValueError):
     _HAS_NATIVE = False
     _NATIVE_STATUS = 'not found'
 

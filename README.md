@@ -117,6 +117,25 @@ mpremote cp natmod/sam_render_rp2.mpy :lib/sam_render.mpy
 
 For louder output, add a PAM8403 amplifier module (~$1).
 
+## Troubleshooting
+
+**`NotImplementedError: native method too big`** — The `sam_render.mpy` file on your board was compiled for a different MicroPython version. Either remove it (SAM will fall back to the Python renderer) or recompile it against your MicroPython version's headers:
+
+```bash
+# Remove the incompatible module
+mpremote rm :lib/sam_render.mpy
+
+# Or recompile (see docs/native_module.rst)
+cd natmod && make ARCH=armv6m
+mpremote cp sam_render.mpy :lib/sam_render.mpy
+```
+
+**`MemoryError: memory allocation failed`** — Text is too long for a single render. Lower the `chunk_words` parameter:
+
+```python
+sam.say("long text here...", chunk_words=2)
+```
+
 ## Documentation
 
 Full documentation is in the [`docs/`](docs/) folder:

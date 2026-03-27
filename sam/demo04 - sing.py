@@ -1,6 +1,7 @@
 from sam import SAM                                                           
   
-sam = SAM(pin=0)                                                              
+sam = SAM(pin=0)
+print(sam.info())
                                                         
 # Note-to-pitch mapping (lower value = higher note)                           
 N = {

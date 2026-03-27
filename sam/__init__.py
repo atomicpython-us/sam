@@ -91,11 +91,13 @@ class SAM:
             text: English text string to speak
             chunk_words: Max words per chunk (default 3). Lower = less RAM.
         """
-        import gc
-        for chunk in self._chunk_text(text, chunk_words):
+        import gc, time
+        for chunk, pause_ms in self._chunk_text(text, chunk_words):
             phonemes = text_to_phonemes(chunk)
             if phonemes and phonemes.strip():
                 self.say_phonetic(phonemes)
+                if pause_ms:
+                    time.sleep_ms(pause_ms)
                 gc.collect()
 
     def say_phonetic(self, phoneme_str):
@@ -131,29 +133,45 @@ class SAM:
 
     @staticmethod
     def _chunk_text(text, chunk_words):
-        """Split text into chunks at punctuation, then by word count."""
+        """Split text into chunks at punctuation, then by word count.
+        Yields (chunk_text, pause_ms) tuples. Sentence-ending punctuation
+        gets a longer pause than commas."""
         # Split on any punctuation that represents a pause
         clauses = []
+        delimiters = []
         current = []
         for ch in text:
             current.append(ch)
             if ch in '.!?;,:':
                 clauses.append(''.join(current).strip())
+                delimiters.append(ch)
                 current = []
         if current:
             trail = ''.join(current).strip()
             if trail:
                 clauses.append(trail)
+                delimiters.append('')
 
         # Further split long clauses into word groups
-        for clause in clauses:
+        for ci, clause in enumerate(clauses):
             words = clause.split()
             if not words:
                 continue
+            delim = delimiters[ci] if ci < len(delimiters) else ''
             for i in range(0, len(words), chunk_words):
                 chunk = ' '.join(words[i:i + chunk_words])
-                if chunk.strip():
-                    yield chunk
+                if not chunk.strip():
+                    continue
+                # Only the last sub-chunk of a clause gets the pause
+                is_last = (i + chunk_words >= len(words))
+                if is_last and delim in '.!?':
+                    yield (chunk, 400)   # sentence pause
+                elif is_last and delim in ';:':
+                    yield (chunk, 250)   # clause pause
+                elif is_last and delim == ',':
+                    yield (chunk, 150)   # comma pause
+                else:
+                    yield (chunk, 0)
 
     def sing(self, melody, bpm=80):
         """
@@ -304,19 +322,43 @@ class SAM:
         """Set throat shape (1-255, default 128)."""
         self.throat = max(1, min(255, throat))
 
-    def save_wav(self, text, filename):
+    def save_wav(self, text, filename, chunk_words=3):
         """
         Render text to speech and save as a WAV file.
-        Useful for testing on desktop Python or saving to SD card.
+        Handles large text by chunking, same as say().
 
         Args:
             text: English text to speak
             filename: Output WAV file path
+            chunk_words: Max words per chunk (default 3)
         """
-        buffer = self.generate(text)
-        from .audio import WavWriter
-        writer = WavWriter(filename, sample_rate=SAMPLE_RATE)
-        writer.write(buffer)
+        import struct
+        chunks = []
+        total_samples = 0
+        for chunk, pause_ms in self._chunk_text(text, chunk_words):
+            phonemes = text_to_phonemes(chunk)
+            if phonemes and phonemes.strip():
+                buf = self.generate_phonetic(phonemes)
+                chunks.append(buf)
+                total_samples += len(buf)
+                if pause_ms:
+                    silence_len = (SAMPLE_RATE * pause_ms) // 1000
+                    chunks.append(bytearray(b'\x80' * silence_len))
+                    total_samples += silence_len
+
+        with open(filename, 'wb') as f:
+            # WAV header
+            f.write(b'RIFF')
+            f.write(struct.pack('<I', 36 + total_samples))
+            f.write(b'WAVE')
+            f.write(b'fmt ')
+            f.write(struct.pack('<IHHIIHH', 16, 1, 1,
+                    SAMPLE_RATE, SAMPLE_RATE, 1, 8))
+            f.write(b'data')
+            f.write(struct.pack('<I', total_samples))
+            for buf in chunks:
+                f.write(bytes(buf))
+
         return filename
 
     def info(self):
