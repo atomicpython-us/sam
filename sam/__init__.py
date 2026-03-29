@@ -93,12 +93,12 @@ class SAM:
         """
         import gc, time
         for chunk, pause_ms in self._chunk_text(text, chunk_words):
+            gc.collect()
             phonemes = text_to_phonemes(chunk)
             if phonemes and phonemes.strip():
                 self.say_phonetic(phonemes)
                 if pause_ms:
                     time.sleep_ms(pause_ms)
-                gc.collect()
 
     def say_phonetic(self, phoneme_str):
         """
@@ -111,6 +111,9 @@ class SAM:
         Args:
             phoneme_str: SAM phoneme string
         """
+        import gc
+        gc.collect()
+
         # Strip leading '/' if present (common SAM convention)
         if phoneme_str.startswith('/'):
             phoneme_str = phoneme_str[1:]
@@ -119,6 +122,8 @@ class SAM:
         phoneme_index, phoneme_length, stress = process_phonemes(
             phoneme_str, self.speed
         )
+
+        gc.collect()
 
         # Render to audio samples
         buffer = render(
@@ -132,46 +137,57 @@ class SAM:
         audio.play(buffer)
 
     @staticmethod
-    def _chunk_text(text, chunk_words):
-        """Split text into chunks at punctuation, then by word count.
-        Yields (chunk_text, pause_ms) tuples. Sentence-ending punctuation
-        gets a longer pause than commas."""
-        # Split on any punctuation that represents a pause
-        clauses = []
-        delimiters = []
+    def _split_token(word):
+        """Split a single token on embedded punctuation.
+        Handles IP addresses, versions, etc. (e.g. '192.168.1.207').
+        Yields (sub_token, pause_ms) tuples."""
+        _PAUSE = {'.': 150, '!': 400, '?': 400, ';': 250, ':': 250, ',': 150}
         current = []
-        for ch in text:
-            current.append(ch)
-            if ch in '.!?;,:':
-                clauses.append(''.join(current).strip())
-                delimiters.append(ch)
+        for ch in word:
+            if ch in _PAUSE:
+                token = ''.join(current).strip()
+                if token:
+                    yield (token, _PAUSE[ch])
                 current = []
-        if current:
-            trail = ''.join(current).strip()
-            if trail:
-                clauses.append(trail)
-                delimiters.append('')
+            else:
+                current.append(ch)
+        token = ''.join(current).strip()
+        if token:
+            yield (token, 0)
 
-        # Further split long clauses into word groups
-        for ci, clause in enumerate(clauses):
-            words = clause.split()
-            if not words:
-                continue
-            delim = delimiters[ci] if ci < len(delimiters) else ''
-            for i in range(0, len(words), chunk_words):
-                chunk = ' '.join(words[i:i + chunk_words])
-                if not chunk.strip():
-                    continue
-                # Only the last sub-chunk of a clause gets the pause
-                is_last = (i + chunk_words >= len(words))
-                if is_last and delim in '.!?':
-                    yield (chunk, 400)   # sentence pause
-                elif is_last and delim in ';:':
-                    yield (chunk, 250)   # clause pause
-                elif is_last and delim == ',':
-                    yield (chunk, 150)   # comma pause
-                else:
-                    yield (chunk, 0)
+    @staticmethod
+    def _chunk_text(text, chunk_words):
+        """Split text into small speakable chunks to limit memory usage.
+        Yields (chunk_text, pause_ms) tuples.
+
+        First splits on whitespace, then breaks individual tokens that
+        contain embedded punctuation (IP addresses, version numbers, etc.)
+        into separate sub-tokens. Finally groups plain words up to
+        chunk_words per group."""
+        raw_words = text.split()
+        # Flatten all tokens, splitting on embedded punctuation
+        tokens = []  # list of (text, pause_ms)
+        for word in raw_words:
+            has_punct = False
+            for ch in word:
+                if ch in '.!?;,:':
+                    has_punct = True
+                    break
+            if has_punct:
+                for tok, pause in SAM._split_token(word):
+                    tokens.append((tok, pause))
+            else:
+                tokens.append((word, 0))
+
+        # Group consecutive no-pause tokens up to chunk_words
+        group = []
+        for tok, pause in tokens:
+            group.append(tok)
+            if pause or len(group) >= chunk_words:
+                yield (' '.join(group), pause)
+                group = []
+        if group:
+            yield (' '.join(group), 0)
 
     def sing(self, melody, bpm=80):
         """
@@ -358,6 +374,63 @@ class SAM:
             f.write(struct.pack('<I', total_samples))
             for buf in chunks:
                 f.write(bytes(buf))
+
+        return filename
+
+    def save_wav_sing(self, melody, filename, bpm=80):
+        """
+        Render a melody to a WAV file (no hardware needed).
+
+        Args:
+            melody: List of (pitch, phonemes, beats) tuples
+            filename: Output WAV file path
+            bpm: Tempo in beats per minute (default 80)
+        """
+        import struct
+
+        samples_per_beat = (60 * SAMPLE_RATE) // bpm
+        orig_pitch = self.pitch
+        orig_speed = self.speed
+        fade_len = SAMPLE_RATE // 20  # 50ms fade-out
+
+        # Calculate total samples
+        total_samples = 0
+        for _, _, beats in melody:
+            total_samples += int(samples_per_beat * beats)
+
+        # Build complete buffer
+        buf = bytearray(b'\x80' * total_samples)
+        pos = 0
+        for pitch, phonemes, beats in melody:
+            target = int(samples_per_beat * beats)
+            if pitch > 0 and phonemes:
+                self.pitch = pitch
+                self.speed = max(40, min(200, int(100 * beats)))
+                raw = self.generate_phonetic(phonemes)
+                copy_len = min(len(raw), target)
+                buf[pos:pos + copy_len] = raw[:copy_len]
+                # Fade out
+                fade = min(fade_len, copy_len)
+                fade_start = pos + copy_len - fade
+                for m in range(fade):
+                    t = fade - m
+                    buf[fade_start + m] = 128 + ((buf[fade_start + m] - 128) * t) // fade
+            pos += target
+
+        self.pitch = orig_pitch
+        self.speed = orig_speed
+
+        # Write WAV
+        with open(filename, 'wb') as f:
+            f.write(b'RIFF')
+            f.write(struct.pack('<I', 36 + total_samples))
+            f.write(b'WAVE')
+            f.write(b'fmt ')
+            f.write(struct.pack('<IHHIIHH', 16, 1, 1,
+                    SAMPLE_RATE, SAMPLE_RATE, 1, 8))
+            f.write(b'data')
+            f.write(struct.pack('<I', total_samples))
+            f.write(bytes(buf))
 
         return filename
 
