@@ -12,22 +12,36 @@ Three-stage pipeline:
 Audio output via PIO-driven PWM on a GPIO pin at 22050 Hz sample rate.
 Falls back to timer-based PWM on non-RP2040 platforms.
 
+atomic_voice enhancements:
+  - Plugin engine for composable voice processing
+  - LF glottal pulse for more natural voicing
+  - Formant interpolation for smooth coarticulation
+  - Aspiration noise for breathy quality
+  - Formant bandwidth widening for softer resonance
+  - F0 prosody contour (via ProsodyPlugin)
+
 Usage:
     from sam import SAM
     sam = SAM(pin=0)
     sam.say("hello world")
     sam.say_phonetic("/HEH4LOW WERLD")
 
+    # With enhancements:
+    from sam.plugins import ProsodyPlugin, ReverbPlugin
+    sam = SAM(pin=0, plugins=[ProsodyPlugin(), ReverbPlugin()])
+    sam.say("Hello, how are you today?")
+
 Hardware:
     GPIO pin --[1K resistor]--> speaker --> GND
     Optional: 100nF cap across speaker for LC filtering
 """
 
-__version__ = '1.0.0'
+__version__ = '2.0.0'
 
 from .reciter import text_to_phonemes
 from .phonemes import process_phonemes
 from .renderer import render, SAMPLE_RATE, _HAS_NATIVE, _NATIVE_STATUS
+from .renderer import FLAG_GLOTTAL_LF, FLAG_ASPIRATION, FLAG_BANDWIDTH, FLAG_INTERPOLATE, FLAG_ALL
 
 
 # Voice presets: (speed, pitch, mouth, throat)
@@ -41,6 +55,10 @@ VOICES = {
     'giant':     (82, 40, 190, 110),   # Deep, booming
     'child':     (68, 96, 110, 140),   # High, small
     'stuffy':    (72, 64, 160, 100),   # Nasal, congested
+    # atomic_voice presets (use enhancement flags)
+    'natural':   (72, 64, 128, 128),   # SAM + all enhancements
+    'warm':      (76, 58, 140, 120),   # Deep, warm, natural
+    'bright':    (68, 80, 115, 145),   # Bright, clear, natural
 }
 
 
@@ -55,11 +73,17 @@ class SAM:
         mouth: Mouth shape (1-255, default 128). Affects formant balance.
         throat: Throat shape (1-255, default 128). Affects formant balance.
         voice: Optional preset name (overrides speed/pitch/mouth/throat).
+        plugins: List of VoicePlugin instances for voice enhancement.
+        enh_flags: Enhancement bit flags for C renderer (default 0 = original SAM).
+                   Use FLAG_ALL for all enhancements, or combine individual flags.
     """
 
-    def __init__(self, pin=0, speed=72, pitch=64, mouth=128, throat=128, voice=None):
+    def __init__(self, pin=0, speed=72, pitch=64, mouth=128, throat=128,
+                 voice=None, plugins=None, enh_flags=0):
         self._pin = pin
         self._audio = None
+        self.plugins = plugins or []
+        self.enh_flags = enh_flags
         if voice:
             self.set_voice(voice)
         else:
@@ -67,6 +91,22 @@ class SAM:
             self.pitch = pitch
             self.mouth = mouth
             self.throat = throat
+
+    def add_plugin(self, plugin):
+        """Add a voice enhancement plugin to the processing chain.
+
+        Args:
+            plugin: VoicePlugin instance
+        """
+        self.plugins.append(plugin)
+
+    def remove_plugin(self, name):
+        """Remove a plugin by name.
+
+        Args:
+            name: Plugin name string
+        """
+        self.plugins = [p for p in self.plugins if p.name != name]
 
     def _get_audio(self):
         """Lazy-initialize the audio driver. Prefers PIO on RP2040."""
@@ -96,9 +136,52 @@ class SAM:
             gc.collect()
             phonemes = text_to_phonemes(chunk)
             if phonemes and phonemes.strip():
-                self.say_phonetic(phonemes)
+                self._say_phonetic_with_text(phonemes, text)
                 if pause_ms:
                     time.sleep_ms(pause_ms)
+
+    def _say_phonetic_with_text(self, phoneme_str, original_text=""):
+        """Internal: speak phonemes with original text context for plugins."""
+        import gc
+        gc.collect()
+
+        if phoneme_str.startswith('/'):
+            phoneme_str = phoneme_str[1:]
+
+        phoneme_index, phoneme_length, stress = process_phonemes(
+            phoneme_str, self.speed
+        )
+
+        # Plugin stage 1: process phonemes
+        for plugin in self.plugins:
+            phoneme_index, phoneme_length, stress = plugin.process_phonemes(
+                phoneme_index, phoneme_length, stress
+            )
+
+        gc.collect()
+
+        # Render to audio samples (with enhancement flags)
+        buffer = render(
+            phoneme_index, phoneme_length, stress,
+            speed=self.speed, pitch=self.pitch,
+            mouth=self.mouth, throat=self.throat,
+            enh_flags=self.enh_flags
+        )
+
+        # Plugin stage 2: process pitches
+        # (Pitches are baked into the rendered buffer at this point for C renderer,
+        #  but we can still apply prosody-aware post-processing)
+        # Note: For full pitch control, ProsodyPlugin modifies the pitch array
+        # before rendering. This is done via the generate path. For the play path,
+        # audio-level plugins still apply.
+
+        # Plugin stage 3: process audio
+        for plugin in self.plugins:
+            buffer = plugin.process_audio(buffer)
+
+        # Play through PWM
+        audio = self._get_audio()
+        audio.play(buffer)
 
     def say_phonetic(self, phoneme_str):
         """
@@ -111,30 +194,7 @@ class SAM:
         Args:
             phoneme_str: SAM phoneme string
         """
-        import gc
-        gc.collect()
-
-        # Strip leading '/' if present (common SAM convention)
-        if phoneme_str.startswith('/'):
-            phoneme_str = phoneme_str[1:]
-
-        # Process phonemes through the parser pipeline
-        phoneme_index, phoneme_length, stress = process_phonemes(
-            phoneme_str, self.speed
-        )
-
-        gc.collect()
-
-        # Render to audio samples
-        buffer = render(
-            phoneme_index, phoneme_length, stress,
-            speed=self.speed, pitch=self.pitch,
-            mouth=self.mouth, throat=self.throat
-        )
-
-        # Play through PWM
-        audio = self._get_audio()
-        audio.play(buffer)
+        self._say_phonetic_with_text(phoneme_str, "")
 
     @staticmethod
     def _split_token(word):
@@ -249,6 +309,10 @@ class SAM:
                     del raw
                 pos += target
 
+            # Apply audio plugins to the phrase
+            for plugin in self.plugins:
+                buf = plugin.process_audio(buf)
+
             audio.play(buf)
             del buf
             gc.collect()
@@ -271,7 +335,58 @@ class SAM:
         phonemes = text_to_phonemes(text)
         if not phonemes:
             return bytearray(0)
-        return self.generate_phonetic(phonemes)
+        return self._generate_phonetic_with_text(phonemes, text)
+
+    def _generate_phonetic_with_text(self, phoneme_str, original_text=""):
+        """Internal: generate audio with full plugin pipeline."""
+        if phoneme_str.startswith('/'):
+            phoneme_str = phoneme_str[1:]
+
+        phoneme_index, phoneme_length, stress = process_phonemes(
+            phoneme_str, self.speed
+        )
+
+        # Plugin stage 1: process phonemes
+        for plugin in self.plugins:
+            phoneme_index, phoneme_length, stress = plugin.process_phonemes(
+                phoneme_index, phoneme_length, stress
+            )
+
+        # Plugin stage 2: process pitches (before rendering)
+        # We need to create frames first to get the pitch array, then let plugins modify it
+        from .renderer import create_frames
+        result = create_frames(phoneme_index, phoneme_length, stress,
+                               self.pitch, self.mouth, self.throat)
+        fr1, fr2, fr3, am1, am2, am3, pitches, samp_flags, num_frames = result
+
+        if num_frames == 0:
+            return bytearray(0)
+
+        # Let plugins modify the pitch contour
+        for plugin in self.plugins:
+            pitches = plugin.process_pitches(pitches, stress, original_text)
+
+        # Render with pre-built frames (call C module or Python fallback directly)
+        from .renderer import _HAS_NATIVE
+        if _HAS_NATIVE:
+            from .renderer import _native
+            buffer = _native.process_frames(
+                fr1, fr2, fr3, am1, am2, am3,
+                pitches, samp_flags, num_frames, self.speed, self.enh_flags
+            )
+        else:
+            # For Python fallback, we need to use the render loop directly
+            # Pass the pre-built frames through the synthesis loop
+            buffer = _render_from_frames(
+                fr1, fr2, fr3, am1, am2, am3,
+                pitches, samp_flags, num_frames, self.speed, self.enh_flags
+            )
+
+        # Plugin stage 3: process audio
+        for plugin in self.plugins:
+            buffer = plugin.process_audio(buffer)
+
+        return buffer
 
     def generate_phonetic(self, phoneme_str):
         """
@@ -283,6 +398,10 @@ class SAM:
         Returns:
             bytearray of 8-bit unsigned PCM at ~22,050 Hz
         """
+        if self.plugins:
+            return self._generate_phonetic_with_text(phoneme_str, "")
+
+        # Fast path: no plugins, use render() directly
         if phoneme_str.startswith('/'):
             phoneme_str = phoneme_str[1:]
 
@@ -293,7 +412,8 @@ class SAM:
         return render(
             phoneme_index, phoneme_length, stress,
             speed=self.speed, pitch=self.pitch,
-            mouth=self.mouth, throat=self.throat
+            mouth=self.mouth, throat=self.throat,
+            enh_flags=self.enh_flags
         )
 
     def text_to_phonemes(self, text):
@@ -309,11 +429,18 @@ class SAM:
         return text_to_phonemes(text)
 
     def set_voice(self, name):
-        """Apply a voice preset by name. Use list_voices() to see options."""
+        """Apply a voice preset by name. Use list_voices() to see options.
+
+        The 'natural', 'warm', and 'bright' presets automatically enable
+        all enhancement flags for the most realistic output.
+        """
         name = name.lower()
         if name not in VOICES:
             raise ValueError('Unknown voice: ' + name + '. Use list_voices().')
         self.speed, self.pitch, self.mouth, self.throat = VOICES[name]
+        # Enable all enhancements for the new atomic_voice presets
+        if name in ('natural', 'warm', 'bright'):
+            self.enh_flags = FLAG_ALL
 
     @staticmethod
     def list_voices():
@@ -354,7 +481,7 @@ class SAM:
         for chunk, pause_ms in self._chunk_text(text, chunk_words):
             phonemes = text_to_phonemes(chunk)
             if phonemes and phonemes.strip():
-                buf = self.generate_phonetic(phonemes)
+                buf = self._generate_phonetic_with_text(phonemes, text) if self.plugins else self.generate_phonetic(phonemes)
                 chunks.append(buf)
                 total_samples += len(buf)
                 if pause_ms:
@@ -420,6 +547,10 @@ class SAM:
         self.pitch = orig_pitch
         self.speed = orig_speed
 
+        # Apply audio plugins
+        for plugin in self.plugins:
+            buf = plugin.process_audio(buf)
+
         # Write WAV
         with open(filename, 'wb') as f:
             f.write(b'RIFF')
@@ -447,9 +578,202 @@ class SAM:
         print('  pin:', self._pin)
         print('  speed:', self.speed, ' pitch:', self.pitch,
               ' mouth:', self.mouth, ' throat:', self.throat)
+        print('  enhancement flags: 0x{:02x}'.format(self.enh_flags))
+        enh_names = []
+        if self.enh_flags & FLAG_GLOTTAL_LF: enh_names.append('glottal_lf')
+        if self.enh_flags & FLAG_ASPIRATION: enh_names.append('aspiration')
+        if self.enh_flags & FLAG_BANDWIDTH: enh_names.append('bandwidth')
+        if self.enh_flags & FLAG_INTERPOLATE: enh_names.append('interpolate')
+        print('  enhancements:', ', '.join(enh_names) if enh_names else 'none (original SAM)')
+        if self.plugins:
+            print('  plugins:', ', '.join(p.name for p in self.plugins))
+        else:
+            print('  plugins: none')
 
     def stop(self):
         """Stop any current playback and release hardware."""
         if self._audio:
             self._audio.stop()
             self._audio = None
+
+
+def _render_from_frames(fr1, fr2, fr3, am1, am2, am3, pitches, samp_flags,
+                        num_frames, speed, enh_flags=0):
+    """Render from pre-built frame arrays (used when plugins modify pitches).
+
+    This calls the Python fallback renderer's synthesis loop with
+    pre-computed frame data, bypassing create_frames().
+    """
+    from . import tables
+    from .renderer import GLOTTAL_LF, FLAG_GLOTTAL_LF, FLAG_ASPIRATION, FLAG_BANDWIDTH, FLAG_INTERPOLATE
+
+    bufsize = 4 * speed * num_frames + 4096
+    buf = bytearray(bufsize)
+
+    if enh_flags & FLAG_GLOTTAL_LF:
+        sin_t = GLOTTAL_LF
+    else:
+        sin_t = tables.SINUS
+
+    rec_t = tables.RECTANGLE
+    mul_t = tables.MULT_TABLE
+    sam_t = tables.SAMPLE_TABLE
+    sam_t_len = len(sam_t)
+    tt = tables.TIME_TABLE
+    t48 = tables.TAB48426
+
+    use_aspiration = bool(enh_flags & FLAG_ASPIRATION)
+    use_bandwidth = bool(enh_flags & FLAG_BANDWIDTH)
+    use_interp = bool(enh_flags & FLAG_INTERPOLATE)
+
+    bufpos = 0
+    old_ti = 0
+    phase1 = 0; phase2 = 0; phase3 = 0
+    m_off = 0
+    y = 0
+    k = num_frames
+    speedcounter = speed
+    glottal_pulse = pitches[0]
+    n = glottal_pulse - (glottal_pulse >> 2)
+
+    lcg_state = 0xDEADBEEF
+    prev_f1 = fr1[0]; prev_f2 = fr2[0]; prev_f3 = fr3[0]
+    interp_counter = 0
+
+    while k:
+        flags = samp_flags[y] if y < num_frames else 0
+
+        if flags & 248:
+            hibyte = ((flags & 7) - 1) & 0xFF
+            hi = hibyte * 256
+            pitchl = flags & 248
+
+            if pitchl == 0:
+                pitchl = pitches[y] >> 4
+                off = m_off & 0xFF
+                vph = (pitchl ^ 255) & 0xFF
+                while True:
+                    sample = sam_t[hi + off] if hi + off < sam_t_len else 0
+                    for _ in range(8):
+                        if sample & 128:
+                            bufpos += tt[old_ti][3]; old_ti = 3
+                            p = bufpos // 50
+                            if p + 4 < bufsize:
+                                buf[p]=160;buf[p+1]=160;buf[p+2]=160;buf[p+3]=160;buf[p+4]=160
+                        else:
+                            bufpos += tt[old_ti][4]; old_ti = 4
+                            p = bufpos // 50
+                            if p + 4 < bufsize:
+                                buf[p]=96;buf[p+1]=96;buf[p+2]=96;buf[p+3]=96;buf[p+4]=96
+                        sample = (sample << 1) & 0xFF
+                    off = (off + 1) & 0xFF
+                    vph = (vph + 1) & 0xFF
+                    if vph == 0: break
+                m_off = off
+            else:
+                off = (pitchl ^ 255) & 0xFF
+                m_val = t48[hibyte] if hibyte < len(t48) else 0x18
+                v0 = (m_val & 15) * 16
+                while True:
+                    sample = sam_t[hi + off] if hi + off < sam_t_len else 0
+                    for _ in range(8):
+                        if sample & 128:
+                            bufpos += tt[old_ti][2]; old_ti = 2
+                            p = bufpos // 50
+                            if p + 4 < bufsize:
+                                buf[p]=80;buf[p+1]=80;buf[p+2]=80;buf[p+3]=80;buf[p+4]=80
+                        else:
+                            bufpos += tt[old_ti][1]; old_ti = 1
+                            p = bufpos // 50
+                            if p + 4 < bufsize:
+                                buf[p]=v0;buf[p+1]=v0;buf[p+2]=v0;buf[p+3]=v0;buf[p+4]=v0
+                        sample = (sample << 1) & 0xFF
+                    off = (off + 1) & 0xFF
+                    if off == 0: break
+
+            y = (y + 2) & 0xFF
+            k = (k - 2) & 0xFF
+            speedcounter = speed
+            if y < num_frames:
+                prev_f1 = fr1[y]; prev_f2 = fr2[y]; prev_f3 = fr3[y]
+            interp_counter = 0
+        else:
+            if use_interp and speed > 0:
+                t_interp = interp_counter
+                total = speed
+                cur_f1 = prev_f1 + ((fr1[y] - prev_f1) * t_interp) // total
+                cur_f2 = prev_f2 + ((fr2[y] - prev_f2) * t_interp) // total
+                cur_f3 = prev_f3 + ((fr3[y] - prev_f3) * t_interp) // total
+            else:
+                cur_f1 = fr1[y]; cur_f2 = fr2[y]; cur_f3 = fr3[y]
+
+            tmp = mul_t[sin_t[phase1] | am1[y]]
+            tmp += mul_t[sin_t[phase2] | am2[y]]
+            if tmp > 255: tmp += 1
+            tmp += mul_t[rec_t[phase3] | am3[y]]
+
+            if use_bandwidth:
+                tmp = ((tmp * 13 + 384) >> 4) & 0xFF
+
+            tmp = ((tmp + 136) >> 4) & 0x0F
+
+            if use_aspiration and am1[y] > 0:
+                noise = (lcg_state >> 16) & 0x0F
+                lcg_state = (lcg_state * 1664525 + 1013904223) & 0xFFFFFFFF
+                tmp = ((tmp * 14 + noise) >> 4) & 0x0F
+
+            bufpos += tt[old_ti][0]; old_ti = 0
+            p = bufpos // 50
+            if p + 4 < bufsize:
+                v = tmp * 16
+                buf[p]=v;buf[p+1]=v;buf[p+2]=v;buf[p+3]=v;buf[p+4]=v
+
+            interp_counter += 1
+            speedcounter = (speedcounter - 1) & 0xFF
+            if speedcounter == 0:
+                prev_f1 = fr1[y]; prev_f2 = fr2[y]; prev_f3 = fr3[y]
+                interp_counter = 0
+                y = (y + 1) & 0xFF
+                k = (k - 1) & 0xFF
+                if k == 0: break
+                speedcounter = speed
+
+            glottal_pulse = (glottal_pulse - 1) & 0xFF
+            if glottal_pulse != 0:
+                n = (n - 1) & 0xFF
+                if (n != 0) or (flags == 0):
+                    phase1 = (phase1 + cur_f1) & 0xFF
+                    phase2 = (phase2 + cur_f2) & 0xFF
+                    phase3 = (phase3 + cur_f3) & 0xFF
+                    continue
+
+                hibyte = ((flags & 7) - 1) & 0xFF
+                hi = hibyte * 256
+                pitchl = pitches[y] >> 4
+                off = m_off & 0xFF
+                vph = (pitchl ^ 255) & 0xFF
+                while True:
+                    sample = sam_t[hi + off] if hi + off < sam_t_len else 0
+                    for _ in range(8):
+                        if sample & 128:
+                            bufpos += tt[old_ti][3]; old_ti = 3
+                            p = bufpos // 50
+                            if p + 4 < bufsize:
+                                buf[p]=160;buf[p+1]=160;buf[p+2]=160;buf[p+3]=160;buf[p+4]=160
+                        else:
+                            bufpos += tt[old_ti][4]; old_ti = 4
+                            p = bufpos // 50
+                            if p + 4 < bufsize:
+                                buf[p]=96;buf[p+1]=96;buf[p+2]=96;buf[p+3]=96;buf[p+4]=96
+                        sample = (sample << 1) & 0xFF
+                    off = (off + 1) & 0xFF
+                    vph = (vph + 1) & 0xFF
+                    if vph == 0: break
+                m_off = off
+
+        glottal_pulse = pitches[y]
+        n = glottal_pulse - (glottal_pulse >> 2)
+        phase1 = 0; phase2 = 0; phase3 = 0
+
+    end = bufpos // 50
+    return buf[:end]
